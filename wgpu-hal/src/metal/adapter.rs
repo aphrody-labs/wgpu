@@ -1,11 +1,11 @@
 use objc2::rc::autoreleasepool;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{available, sel};
-use objc2_foundation::{NSOperatingSystemVersion, NSProcessInfo};
+use objc2_foundation::{NSOperatingSystemVersion, NSProcessInfo, NSString};
 use objc2_metal::{
-    MTLArgumentBuffersTier, MTLCounterSamplingPoint, MTLDevice, MTLFeatureSet, MTLGPUFamily,
-    MTLIndirectAccelerationStructureInstanceDescriptor, MTLLanguageVersion, MTLPixelFormat,
-    MTLReadWriteTextureTier,
+    MTLArgumentBuffersTier, MTLCompileOptions, MTLCounterSamplingPoint, MTLDevice, MTLFeatureSet,
+    MTLGPUFamily, MTLIndirectAccelerationStructureInstanceDescriptor, MTLLanguageVersion,
+    MTLPixelFormat, MTLReadWriteTextureTier,
 };
 use wgt::{AstcBlock, AstcChannel};
 
@@ -15,6 +15,51 @@ use wgpu_sync::{atomic, Mutex, OnceCell};
 use crate::metal::QueueShared;
 
 use super::{OsFeatures, TimestampQuerySupport};
+
+/// The Metal language version to compile shaders with, as Craft Anything needs it.
+///
+/// wgpu takes the version from the macOS version alone, but the system's Metal compiler may not
+/// accept it: on some Macs with older GPUs (OpenCore Legacy Patcher) macOS 15 expects Metal 3.2
+/// and the compiler stops at 3.1, so every shader fails and the device is lost (wgpu #10687,
+/// Craft Anything #742). This compiles a tiny kernel with each version up to the OS's, highest
+/// first, and keeps the first one the compiler accepts. If none is accepted, the OS's version is
+/// kept, as before.
+fn accepted_msl_version(
+    device: &ProtocolObject<dyn MTLDevice>,
+    os_version: MTLLanguageVersion,
+) -> MTLLanguageVersion {
+    const CANDIDATES: [MTLLanguageVersion; 9] = [
+        MTLLanguageVersion::Version4_0,
+        MTLLanguageVersion::Version3_2,
+        MTLLanguageVersion::Version3_1,
+        MTLLanguageVersion::Version3_0,
+        MTLLanguageVersion::Version2_4,
+        MTLLanguageVersion::Version2_3,
+        MTLLanguageVersion::Version2_2,
+        MTLLanguageVersion::Version2_1,
+        MTLLanguageVersion::Version2_0,
+    ];
+    let probe = NSString::from_str(
+        "#include <metal_stdlib>\nusing namespace metal;\nkernel void wgpu_msl_probe() {}\n",
+    );
+    for candidate in CANDIDATES.into_iter().filter(|v| *v <= os_version) {
+        let options = MTLCompileOptions::new();
+        options.setLanguageVersion(candidate);
+        if device
+            .newLibraryWithSource_options_error(&probe, Some(&options))
+            .is_ok()
+        {
+            if candidate != os_version {
+                log::warn!(
+                    "The Metal compiler does not accept the language version expected from this OS ({os_version:?}); using {candidate:?} instead"
+                );
+            }
+            return candidate;
+        }
+    }
+    log::warn!("The Metal compiler accepted none of the language versions up to {os_version:?}; using it anyway");
+    os_version
+}
 
 /// Check if a device's class has a given method in its method table.
 ///
@@ -707,7 +752,7 @@ impl super::CapabilitiesQuery {
                     // Mesh shaders don't work on virtual devices even if they should be supported. CI thing
                 && !is_virtual;
 
-        let msl_version = if available!(macos = 26.0, ios = 26.0, tvos = 26.0, visionos = 26.0) {
+        let os_msl_version = if available!(macos = 26.0, ios = 26.0, tvos = 26.0, visionos = 26.0) {
             MTLLanguageVersion::Version4_0
         } else if available!(macos = 15.0, ios = 18.0, tvos = 18.0, visionos = 2.0) {
             MTLLanguageVersion::Version3_2
@@ -732,6 +777,7 @@ impl super::CapabilitiesQuery {
         } else {
             MTLLanguageVersion::Version1_0
         };
+        let msl_version = accepted_msl_version(device, os_msl_version);
 
         Self {
             msl_version,
