@@ -617,6 +617,7 @@ pub struct Frontend<I> {
     temp_bytes: Vec<u8>,
     ext_glsl_id: Option<spirv::Word>,
     ext_non_semantic_id: Option<spirv::Word>,
+    ext_debug_printf_id: Option<spirv::Word>,
     future_decor: FastHashMap<spirv::Word, Decoration>,
     future_member_decor: FastHashMap<(spirv::Word, MemberIndex), Decoration>,
     lookup_member: FastHashMap<(Handle<crate::Type>, MemberIndex), LookupMember>,
@@ -628,6 +629,7 @@ pub struct Frontend<I> {
     /// [`Atomic`]: crate::Statement::Atomic
     upgrade_atomics: Upgrades,
 
+    lookup_string: FastHashMap<spirv::Word, String>,
     lookup_type: FastHashMap<spirv::Word, LookupType>,
     lookup_void_type: Option<spirv::Word>,
     lookup_storage_buffer_types: FastHashMap<Handle<crate::Type>, crate::StorageAccess>,
@@ -685,11 +687,13 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
             temp_bytes: Vec::new(),
             ext_glsl_id: None,
             ext_non_semantic_id: None,
+            ext_debug_printf_id: None,
             future_decor: FastHashMap::default(),
             future_member_decor: FastHashMap::default(),
             handle_sampling: FastHashMap::default(),
             lookup_member: FastHashMap::default(),
             upgrade_atomics: Default::default(),
+            lookup_string: FastHashMap::default(),
             lookup_type: FastHashMap::default(),
             lookup_void_type: None,
             lookup_storage_buffer_types: FastHashMap::default(),
@@ -1076,9 +1080,9 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
         let left = self.get_expr_handle(p1_id, p1_lexp, ctx, emitter, block, body_idx);
 
         let result_lookup_ty = self.lookup_type.lookup(result_type_id)?;
-        let kind = ctx.module.types[result_lookup_ty.handle]
+        let target = ctx.module.types[result_lookup_ty.handle]
             .inner
-            .scalar_kind()
+            .scalar()
             .unwrap();
 
         let expr = crate::Expression::Unary {
@@ -1086,14 +1090,8 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
             expr: if p1_lexp.type_id == result_type_id {
                 left
             } else {
-                ctx.expressions.append(
-                    crate::Expression::As {
-                        expr: left,
-                        kind,
-                        convert: None,
-                    },
-                    span,
-                )
+                ctx.expressions
+                    .append(crate::Expression::As { expr: left, target }, span)
             },
         };
 
@@ -1142,9 +1140,9 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
             SignAnchor::Operand => p1_lexp.type_id,
         };
         let expected_lookup_ty = self.lookup_type.lookup(expected_type_id)?;
-        let kind = ctx.module.types[expected_lookup_ty.handle]
+        let target = ctx.module.types[expected_lookup_ty.handle]
             .inner
-            .scalar_kind()
+            .scalar()
             .unwrap();
 
         let expr = crate::Expression::Binary {
@@ -1152,14 +1150,8 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
             left: if p1_lexp.type_id == expected_type_id {
                 left
             } else {
-                ctx.expressions.append(
-                    crate::Expression::As {
-                        expr: left,
-                        kind,
-                        convert: None,
-                    },
-                    span,
-                )
+                ctx.expressions
+                    .append(crate::Expression::As { expr: left, target }, span)
             },
             right: if p2_lexp.type_id == expected_type_id {
                 right
@@ -1167,8 +1159,7 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
                 ctx.expressions.append(
                     crate::Expression::As {
                         expr: right,
-                        kind,
-                        convert: None,
+                        target,
                     },
                     span,
                 )
@@ -1210,40 +1201,35 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
         let p1_lexp = self.lookup_expression.lookup(p1_id)?;
         let left = self.get_expr_handle(p1_id, p1_lexp, ctx, emitter, block, body_idx);
         let p1_lookup_ty = self.lookup_type.lookup(p1_lexp.type_id)?;
-        let p1_kind = ctx.module.types[p1_lookup_ty.handle]
+        let p1_scalar = ctx.module.types[p1_lookup_ty.handle]
             .inner
-            .scalar_kind()
+            .scalar()
             .unwrap();
         let p2_lexp = self.lookup_expression.lookup(p2_id)?;
         let right = self.get_expr_handle(p2_id, p2_lexp, ctx, emitter, block, body_idx);
         let p2_lookup_ty = self.lookup_type.lookup(p2_lexp.type_id)?;
-        let p2_kind = ctx.module.types[p2_lookup_ty.handle]
+        let p2_scalar = ctx.module.types[p2_lookup_ty.handle]
             .inner
-            .scalar_kind()
+            .scalar()
             .unwrap();
 
         let expr = crate::Expression::Binary {
             op,
-            left: if p1_kind == kind {
+            left: if p1_scalar.kind == kind {
                 left
             } else {
-                ctx.expressions.append(
-                    crate::Expression::As {
-                        expr: left,
-                        kind,
-                        convert: None,
-                    },
-                    span,
-                )
+                let target = crate::Scalar { kind, ..p1_scalar };
+                ctx.expressions
+                    .append(crate::Expression::As { expr: left, target }, span)
             },
-            right: if p2_kind == kind {
+            right: if p2_scalar.kind == kind {
                 right
             } else {
+                let target = crate::Scalar { kind, ..p2_scalar };
                 ctx.expressions.append(
                     crate::Expression::As {
                         expr: right,
-                        kind,
-                        convert: None,
+                        target,
                     },
                     span,
                 )
@@ -1283,11 +1269,18 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
         let p2_lexp = self.lookup_expression.lookup(p2_id)?;
         let p2_handle = self.get_expr_handle(p2_id, p2_lexp, ctx, emitter, block, body_idx);
         // convert the shift to Uint
+        let p2_lookup_ty = self.lookup_type.lookup(p2_lexp.type_id)?;
+        let p2_scalar = ctx.module.types[p2_lookup_ty.handle]
+            .inner
+            .scalar()
+            .unwrap();
         let right = ctx.expressions.append(
             crate::Expression::As {
                 expr: p2_handle,
-                kind: crate::ScalarKind::Uint,
-                convert: None,
+                target: crate::Scalar {
+                    kind: crate::ScalarKind::Uint,
+                    ..p2_scalar
+                },
             },
             span,
         );
@@ -1630,9 +1623,12 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
                 | S::Atomic { .. }
                 | S::ImageAtomic { .. }
                 | S::RayQuery { .. }
+                | S::HitObject { .. }
                 | S::SubgroupBallot { .. }
                 | S::SubgroupCollectiveOperation { .. }
                 | S::SubgroupGather { .. }
+                | S::SubgroupBallotFindBit { .. }
+                | S::DebugPrintf { .. }
                 | S::RayPipelineFunction(..) => {}
                 S::Call {
                     function: ref mut callee,
@@ -1908,6 +1904,8 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
             // are ignorable. Many compilers (dxc, slang, etc) will emit these
             // instructions depending on configuration.
             self.ext_non_semantic_id = Some(result_id);
+        } else if &name == "NonSemantic.DebugPrintf" {
+            self.ext_debug_printf_id = Some(result_id);
         } else {
             return Err(Error::UnsupportedExtSet(name));
         }
@@ -2031,8 +2029,9 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
     fn parse_string(&mut self, inst: Instruction) -> Result<(), Error> {
         self.switch(ModuleState::Source, inst.op)?;
         inst.expect_at_least(3)?;
-        let _id = self.next()?;
-        let (_name, _) = self.next_string(inst.wc - 2)?;
+        let id = self.next()?;
+        let (string, _) = self.next_string(inst.wc - 2)?;
+        self.lookup_string.insert(id, string);
         Ok(())
     }
 
@@ -3042,7 +3041,8 @@ impl<I: Iterator<Item = u32>> Frontend<I> {
                         | crate::BuiltIn::SampleIndex
                         | crate::BuiltIn::VertexIndex
                         | crate::BuiltIn::PrimitiveIndex
-                        | crate::BuiltIn::LocalInvocationIndex => {
+                        | crate::BuiltIn::LocalInvocationIndex
+                        | crate::BuiltIn::ViewIndex => {
                             Some(crate::TypeInner::Scalar(crate::Scalar::U32))
                         }
                         crate::BuiltIn::GlobalInvocationId

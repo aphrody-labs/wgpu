@@ -1,7 +1,10 @@
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::future::Future;
 #[cfg(wgpu_core)]
 use core::ops::Deref;
+use hashbrown::HashSet;
+use wgpu_sync::Mutex;
 
 use crate::*;
 
@@ -61,9 +64,15 @@ impl Adapter {
     ) -> impl Future<Output = Result<(Device, Queue), RequestDeviceError>> + WasmNotSend {
         let device = self.inner.request_device(desc);
         async move {
-            device
-                .await
-                .map(|(device, queue)| (Device { inner: device }, Queue { inner: queue }))
+            device.await.map(|(device, queue)| {
+                (
+                    Device {
+                        inner: device,
+                        buffers: Arc::new(Mutex::new(HashSet::new())),
+                    },
+                    Queue { inner: queue },
+                )
+            })
         }
     }
 
@@ -85,6 +94,7 @@ impl Adapter {
         Ok((
             Device {
                 inner: device.into(),
+                buffers: Arc::new(Mutex::new(HashSet::new())),
             },
             Queue {
                 inner: queue.into(),
@@ -214,5 +224,39 @@ impl Adapter {
     /// Requires [`Features::EXPERIMENTAL_COOPERATIVE_MATRIX`] to be meaningful.
     pub fn cooperative_matrix_properties(&self) -> Vec<CooperativeMatrixProperties> {
         self.inner.cooperative_matrix_properties()
+    }
+
+    /// Returns whether the implementation reports that it is likely to reorder ray tracing
+    /// invocations.
+    ///
+    /// `reorderThread` is valid on any adapter supporting
+    /// [`Features::EXPERIMENTAL_RAY_TRACING_INVOCATION_REORDER`], but on an adapter returning
+    /// [`RayTracingInvocationReorderMode::None`] it is not likely to have an effect.
+    ///
+    /// Returns [`RayTracingInvocationReorderMode::None`] if
+    /// [`Features::EXPERIMENTAL_RAY_TRACING_INVOCATION_REORDER`] is not supported.
+    pub fn ray_tracing_invocation_reorder_mode(&self) -> RayTracingInvocationReorderMode {
+        self.inner.ray_tracing_invocation_reorder_mode()
+    }
+}
+
+#[cfg(wgpu_core)]
+impl Adapter {
+    /// Create a new adapter of wgpu from a wgpu-core adapter.
+    ///
+    /// # Arguments
+    ///
+    /// - `core_adapter` - wgpu-core adapter.
+    pub fn from_core(core_adapter: alloc::sync::Arc<wgc::instance::Adapter>) -> Self {
+        Self {
+            inner: crate::backend::wgpu_core::CoreAdapter::from_core(core_adapter).into(),
+        }
+    }
+
+    /// Get the [`wgpu_core`] adapter from this `Adapter`.
+    ///
+    /// Returns `None` if the adapter is not from the `wgpu_core` backend
+    pub fn as_core(&self) -> Option<alloc::sync::Arc<wgc::instance::Adapter>> {
+        self.inner.as_core_opt().map(|adapter| adapter.as_core())
     }
 }

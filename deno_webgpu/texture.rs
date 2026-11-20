@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use deno_core::op2;
+use deno_core::v8;
 use deno_core::webidl::WebIdlInterfaceConverter;
 use deno_core::GarbageCollected;
 use deno_core::WebIDL;
@@ -40,6 +41,7 @@ pub(crate) struct GPUTextureDescriptor {
   pub usage: u32,
   #[webidl(default = vec![])]
   pub view_formats: Vec<GPUTextureFormat>,
+  pub texture_binding_view_dimension: Option<GPUTextureViewDimension>,
 }
 
 pub struct GPUTexture {
@@ -49,6 +51,10 @@ pub struct GPUTexture {
   pub dimension: GPUTextureDimension,
   pub format: GPUTextureFormat,
   pub usage: GPUTextureUsageFlags,
+
+  // Weak reference to the JS object so we can attach a finalizer.
+  // See `GPUDevice::create_texture`.
+  pub weak: OnceLock<v8::Weak<v8::Object>>,
 }
 
 impl GPUTexture {
@@ -193,7 +199,7 @@ struct GPUTextureViewDescriptor {
   swizzle: String,
 }
 
-#[derive(WebIDL)]
+#[derive(WebIDL, Copy, Clone)]
 #[webidl(enum)]
 pub(crate) enum GPUTextureViewDimension {
   #[webidl(rename = "1d")]
@@ -297,7 +303,7 @@ impl From<GPUTextureDimension> for TextureDimension {
   }
 }
 
-#[derive(WebIDL, Clone)]
+#[derive(WebIDL, Clone, Copy)]
 #[webidl(enum)]
 pub(crate) enum GPUTextureFormat {
   #[webidl(rename = "r8unorm")]

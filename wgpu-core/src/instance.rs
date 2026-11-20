@@ -1,5 +1,8 @@
 use alloc::{borrow::ToOwned as _, boxed::Box, string::String, sync::Arc, vec, vec::Vec};
-use core::fmt;
+use core::{
+    fmt,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use hashbrown::HashMap;
 use thiserror::Error;
@@ -21,15 +24,6 @@ use crate::{
 };
 
 use wgt::{Backend, Backends, InstanceFlags, PowerPreference};
-
-#[test]
-fn downlevel_default_limits_less_than_default_limits() {
-    let res = check_limits(&wgt::Limits::downlevel_defaults(), &wgt::Limits::default());
-    assert!(
-        res.is_empty(),
-        "Downlevel limits are greater than default limits",
-    )
-}
 
 #[derive(Debug)]
 pub(crate) struct InstanceDevices(Mutex<WeakVec<Device>>);
@@ -123,85 +117,23 @@ pub struct Instance {
 impl Instance {
     pub fn new(
         name: &str,
-        mut instance_desc: wgt::InstanceDescriptor,
+        instance_desc: wgt::InstanceDescriptor,
         telemetry: Option<hal::Telemetry>,
     ) -> Arc<Self> {
-        let mut this = Self {
-            _name: name.to_owned(),
-            instance_per_backend: Vec::new(),
-            requested_backends: instance_desc.backends,
-            supported_backends: Backends::empty(),
-            flags: instance_desc.flags,
-            // HACK: We must take ownership of the field here, without being able to pass it into
-            // try_add_hal(). Remove it from the mutable descriptor instead, while try_add_hal()
-            // borrows the handle from `this.display` instead.
-            display: instance_desc.display.take(),
-            devices: InstanceDevices::new(),
-        };
+        let mut this = InstanceBuilder::new(name, instance_desc, telemetry);
 
         #[cfg(all(vulkan, not(target_os = "netbsd")))]
-        this.try_add_hal(hal::api::Vulkan, &instance_desc, telemetry);
+        this.try_add_hal(hal::api::Vulkan);
         #[cfg(metal)]
-        this.try_add_hal(hal::api::Metal, &instance_desc, telemetry);
+        this.try_add_hal(hal::api::Metal);
         #[cfg(dx12)]
-        this.try_add_hal(hal::api::Dx12, &instance_desc, telemetry);
+        this.try_add_hal(hal::api::Dx12);
         #[cfg(gles)]
-        this.try_add_hal(hal::api::Gles, &instance_desc, telemetry);
+        this.try_add_hal(hal::api::Gles);
         #[cfg(feature = "noop")]
-        this.try_add_hal(hal::api::Noop, &instance_desc, telemetry);
+        this.try_add_hal(hal::api::Noop);
 
-        Arc::new(this)
-    }
-
-    /// Helper for `Instance::new()`; attempts to add a single `wgpu-hal` backend to this instance.
-    fn try_add_hal<A: hal::Api>(
-        &mut self,
-        _: A,
-        instance_desc: &wgt::InstanceDescriptor,
-        telemetry: Option<hal::Telemetry>,
-    ) {
-        // Whether or not the backend was requested, and whether or not it succeeds,
-        // note that we *could* try it.
-        self.supported_backends |= A::VARIANT.into();
-
-        if !instance_desc.backends.contains(A::VARIANT.into()) {
-            log::trace!("Instance::new: backend {:?} not requested", A::VARIANT);
-            return;
-        }
-
-        // If this was Some, it was moved into self
-        assert!(instance_desc.display.is_none());
-
-        let hal_desc = hal::InstanceDescriptor {
-            name: "wgpu",
-            flags: self.flags,
-            memory_budget_thresholds: instance_desc.memory_budget_thresholds,
-            backend_options: instance_desc.backend_options.clone(),
-            telemetry,
-            // Pass a borrow, the core instance here keeps the owned handle alive already
-            // WARNING: Using self here, not instance_desc!
-            display: self.display.as_ref().map(|hdh| {
-                hdh.display_handle()
-                    .expect("Implementation did not provide a DisplayHandle")
-            }),
-        };
-
-        use hal::Instance as _;
-        // SAFETY: ???
-        match unsafe { A::Instance::init(&hal_desc) } {
-            Ok(instance) => {
-                log::debug!("Instance::new: created {:?} backend", A::VARIANT);
-                self.instance_per_backend
-                    .push((A::VARIANT, Box::new(instance)));
-            }
-            Err(err) => {
-                log::debug!(
-                    "Instance::new: failed to create {:?} backend: {:?}",
-                    A::VARIANT,
-                    err
-                );
-            }
-        }
+        this.build()
     }
 
     pub fn from_hal_instance<A: hal::Api>(
@@ -480,7 +412,7 @@ impl Instance {
             self.flags,
             &raw.info,
             &raw.capabilities.limits,
-            &raw.capabilities.downlevel,
+            raw.features,
         )
     }
 
@@ -492,59 +424,26 @@ impl Instance {
         profiling::scope!("Instance::enumerate_adapters");
         api_log!("Instance::enumerate_adapters");
 
-        let mut adapters = Vec::new();
-        for (_backend, instance) in self
-            .instance_per_backend
-            .iter()
-            .filter(|(backend, _)| backends.contains(Backends::from(*backend)))
-        {
-            // NOTE: We might be using `profiling` without any features. The empty backend of this
-            // macro emits no code, so unused code linting changes depending on the backend.
-            profiling::scope!("enumerating", &*alloc::format!("{_backend:?}"));
-
-            let hal_adapters = unsafe { instance.enumerate_adapters(None) };
-
-            adapters.extend(
-                hal_adapters
-                    .into_iter()
-                    .map(|mut raw| {
-                        self.adjust_limits_for_indirect_validation(&mut raw.capabilities.limits);
-                        raw
-                    })
-                    .map(|mut raw| {
-                        filter_features_and_limits(
-                            self.flags,
-                            &mut raw.features,
-                            &mut raw.capabilities.limits,
-                        );
-                        raw
-                    })
-                    .filter(|raw| self.adapter_allowed(raw))
-                    .filter_map(|raw| {
-                        if apply_limit_buckets {
-                            limits::apply_limit_buckets(raw)
-                        } else {
-                            Some(raw)
-                        }
-                    })
-                    .map(|raw| {
-                        let adapter = Adapter::new(raw, self.clone());
-                        api_log_debug!("Adapter {:?}", adapter.raw.info);
-                        adapter
-                    }),
-            );
-        }
-        adapters
+        self.request_adapters(
+            &wgt::RequestAdapterOptions {
+                power_preference: PowerPreference::None,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+                apply_limit_buckets,
+            },
+            backends,
+        )
+        .unwrap_or_default()
     }
 
-    pub fn request_adapter(
+    /// Returns a list of adapters that match the given request options and are compatible with the specified backends.
+    ///
+    /// On success at least one compatible adapter will be returned in the resulting vector.
+    pub fn request_adapters(
         self: &Arc<Self>,
         desc: &wgt::RequestAdapterOptions<&Surface>,
         backends: Backends,
-    ) -> Result<Arc<Adapter>, wgt::RequestAdapterError> {
-        profiling::scope!("Instance::request_adapter");
-        api_log!("Instance::request_adapter");
-
+    ) -> Result<Vec<Arc<Adapter>>, wgt::RequestAdapterError> {
         let mut adapters = Vec::new();
         let mut incompatible_surface_backends = Backends::empty();
         let mut no_fallback_backends = Backends::empty();
@@ -555,6 +454,8 @@ impl Instance {
             .iter()
             .filter(|&&(backend, _)| backends.contains(Backends::from(backend)))
         {
+            profiling::scope!("enumerating", &*alloc::format!("{backend:?}"));
+
             let compatible_hal_surface = desc
                 .compatible_surface
                 .and_then(|surface| surface.raw(backend));
@@ -666,21 +567,6 @@ impl Instance {
         // Shine some light on its decision in debug log.
         if adapters.is_empty() {
             log::debug!("Request adapter didn't find compatible adapters.");
-        } else {
-            log::debug!(
-                "Found {} compatible adapters. Sorted by preference:",
-                adapters.len()
-            );
-            for adapter in &adapters {
-                log::debug!("* {:?}", adapter.info);
-            }
-        }
-
-        if let Some(adapter) = adapters.into_iter().next() {
-            api_log_debug!("Request adapter result {:?}", adapter.info);
-            let adapter = Adapter::new(adapter, self.clone());
-            Ok(adapter)
-        } else {
             Err(wgt::RequestAdapterError::NotFound {
                 supported_backends: self.supported_backends,
                 requested_backends: self.requested_backends,
@@ -689,7 +575,38 @@ impl Instance {
                 no_adapter_backends,
                 incompatible_surface_backends,
             })
+        } else {
+            log::debug!(
+                "Found {} compatible adapters. Sorted by preference:",
+                adapters.len()
+            );
+            for adapter in &adapters {
+                log::debug!("* {:?}", adapter.info);
+            }
+            Ok(adapters
+                .into_iter()
+                .map(|adapter| Adapter::new(adapter, self.clone()))
+                .collect::<Vec<_>>())
         }
+    }
+
+    pub fn request_adapter(
+        self: &Arc<Self>,
+        desc: &wgt::RequestAdapterOptions<&Surface>,
+        backends: Backends,
+    ) -> Result<Arc<Adapter>, wgt::RequestAdapterError> {
+        profiling::scope!("Instance::request_adapter");
+        api_log!("Instance::request_adapter");
+
+        let adapter = self
+            .request_adapters(desc, backends)?
+            .into_iter()
+            .next()
+            .expect(
+                "request_adapters should always return at least one compatible adapter on success",
+            );
+        api_log_debug!("Request adapter result {:?}", adapter.get_info());
+        Ok(adapter)
     }
 
     /// This is similar to wgpu-hal's `adjust_raw_limits` but tailored to
@@ -753,6 +670,98 @@ impl Instance {
         closures.fire();
 
         Ok(all_queue_empty)
+    }
+}
+
+pub struct InstanceBuilder {
+    instance: Instance,
+    instance_desc: wgt::InstanceDescriptor,
+    telemetry: Option<hal::Telemetry>,
+}
+
+impl InstanceBuilder {
+    pub fn new(
+        name: &str,
+        mut desc: wgt::InstanceDescriptor,
+        telemetry: Option<hal::Telemetry>,
+    ) -> Self {
+        Self {
+            instance: Instance {
+                _name: name.to_owned(),
+                instance_per_backend: Vec::new(),
+                requested_backends: desc.backends,
+                supported_backends: Backends::empty(),
+                flags: desc.flags,
+                // HACK: We must take ownership of the field here, without being able to pass it into
+                // try_add_hal(). Remove it from the mutable descriptor instead, while try_add_hal()
+                // borrows the handle from `this.display` instead.
+                display: desc.display.take(),
+                devices: InstanceDevices::new(),
+            },
+            instance_desc: desc,
+            telemetry,
+        }
+    }
+
+    pub fn try_add_hal<A: hal::Api>(&mut self, api: A) {
+        use hal::Instance as _;
+        self.try_add_custom_hal(api, |hal_desc| unsafe { A::Instance::init(hal_desc) });
+    }
+
+    pub fn try_add_custom_hal<A: hal::Api>(
+        &mut self,
+        _: A,
+        f: impl FnOnce(&hal::InstanceDescriptor) -> Result<A::Instance, hal::InstanceError>,
+    ) {
+        if self.instance.supported_backends.contains(A::VARIANT.into()) {
+            return;
+        }
+
+        // Whether or not the backend was requested, and whether or not it succeeds,
+        // note that we *could* try it.
+        self.instance.supported_backends |= A::VARIANT.into();
+
+        if !self.instance_desc.backends.contains(A::VARIANT.into()) {
+            log::trace!("Instance::new: backend {:?} not requested", A::VARIANT);
+            return;
+        }
+
+        // If this was Some, it was moved into self
+        assert!(self.instance_desc.display.is_none());
+
+        let hal_desc = hal::InstanceDescriptor {
+            name: "wgpu",
+            flags: self.instance.flags,
+            memory_budget_thresholds: self.instance_desc.memory_budget_thresholds,
+            backend_options: self.instance_desc.backend_options.clone(),
+            telemetry: self.telemetry,
+            // Pass a borrow, the core instance here keeps the owned handle alive already
+            // WARNING: Using self here, not instance_desc!
+            display: self.instance.display.as_ref().map(|hdh| {
+                hdh.display_handle()
+                    .expect("Implementation did not provide a DisplayHandle")
+            }),
+        };
+
+        match f(&hal_desc) {
+            Ok(instance) => {
+                log::debug!("Instance::new: created {:?} backend", A::VARIANT);
+                self.instance
+                    .instance_per_backend
+                    .push((A::VARIANT, Box::new(instance)));
+            }
+            Err(err) => {
+                log::debug!(
+                    "Instance::new: failed to create {:?} backend: {:?}",
+                    A::VARIANT,
+                    err
+                );
+            }
+        }
+    }
+
+    pub fn build(self) -> Arc<Instance> {
+        Arc::new(self.instance)
     }
 }
 
@@ -856,11 +865,17 @@ impl Surface {
             .map(|surface| surface.as_ref())
     }
 
-    fn unconfigure_inner<'a>(
+    /// Takes the current configuration, destroys its acquired texture and waits
+    /// for all work on its device to finish.
+    ///
+    /// Returns the device the surface was configured for. The raw surface is
+    /// still configured, so the caller must unconfigure it next.
+    fn take_presentation<'a>(
         &self,
         presentation: &mut MutexGuard<'a, Option<Presentation>>,
-    ) -> UserClosures {
+    ) -> (Option<Arc<Device>>, UserClosures) {
         let mut result = UserClosures::default();
+        let mut device = None;
         if let Some(mut present) = presentation.take() {
             if let Some(texture) = present.acquired_texture.take() {
                 texture.destroy();
@@ -880,7 +895,7 @@ impl Surface {
                     Err(WaitIdleError::Device(_)) => {
                         // we can ignore device lost errors here, since we are just cleaning up
                     }
-                    Err(WaitIdleError::Timeout) if cfg!(target_arch = "wasm32") => {
+                    Err(WaitIdleError::Timeout) if cfg!(target_family = "wasm") => {
                         // On wasm, you cannot actually successfully wait for the surface.
                         // However WebGL does not actually require you do this, so ignoring
                         // the failure is totally fine. See https://github.com/gfx-rs/wgpu/issues/7363
@@ -894,14 +909,33 @@ impl Surface {
                 }
             }
             result.extend(user_callbacks);
-
-            for (&backend, surface) in &self.surface_per_backend {
-                if backend == present.device.backend() {
-                    unsafe { surface.unconfigure(present.device.raw()) };
-                }
-            }
+            device = Some(present.device);
         }
-        result
+        (device, result)
+    }
+
+    /// Unconfigures the raw surface from `device`.
+    ///
+    /// # Safety
+    ///
+    /// `device` must have been returned by [`Self::take_presentation`], and the
+    /// surface must not have been configured since.
+    unsafe fn unconfigure_raw(&self, device: &Device) {
+        if let Some(surface) = self.raw(device.backend()) {
+            let _command_indices = device.command_indices.write();
+            unsafe { surface.unconfigure(device.raw()) };
+        }
+    }
+
+    fn unconfigure_inner<'a>(
+        &self,
+        presentation: &mut MutexGuard<'a, Option<Presentation>>,
+    ) -> UserClosures {
+        let (device, user_callbacks) = self.take_presentation(presentation);
+        if let Some(device) = device {
+            unsafe { self.unconfigure_raw(&device) };
+        }
+        user_callbacks
     }
 
     pub fn unconfigure(self: &Arc<Self>) {
@@ -990,42 +1024,57 @@ impl Surface {
         device.check_is_valid()?;
 
         let user_callbacks;
-        {
+        let result = {
             // we keep presentation locked for the entire duration of the configure call,
             // so that no change can happen in the middle of it.
             let mut presentation = self.presentation.lock();
 
-            user_callbacks = self.unconfigure_inner(&mut presentation);
+            let previous_device;
+            (previous_device, user_callbacks) = self.take_presentation(&mut presentation);
 
             let surface_raw = self.raw(device.backend()).unwrap();
-            match unsafe { surface_raw.configure(device.raw(), &hal_config) } {
-                Ok(()) => (),
-                Err(error) => {
-                    return Err(match error {
-                        hal::SurfaceError::Outdated
-                        | hal::SurfaceError::Lost
-                        | hal::SurfaceError::Occluded
-                        | hal::SurfaceError::Timeout => E::InvalidSurface,
-                        hal::SurfaceError::Device(error) => {
-                            E::Device(device.handle_hal_error(error))
-                        }
-                        hal::SurfaceError::Other(message) => {
-                            log::error!("surface configuration failed: {message}");
-                            E::InvalidSurface
-                        }
-                    });
+            // `command_indices` serializes these calls with other queue
+            // operations. For the same device, hold it across both calls.
+            let result = {
+                let same_device = match previous_device {
+                    Some(previous_device) if Arc::ptr_eq(&previous_device, device) => true,
+                    Some(previous_device) => {
+                        unsafe { self.unconfigure_raw(&previous_device) };
+                        false
+                    }
+                    None => false,
+                };
+                let _command_indices = device.command_indices.write();
+                if same_device {
+                    unsafe { surface_raw.unconfigure(device.raw()) };
                 }
+                unsafe { surface_raw.configure(device.raw(), &hal_config) }
+            };
+            match result {
+                Ok(()) => {
+                    *presentation = Some(Presentation {
+                        device: Arc::clone(device),
+                        config: config.clone(),
+                        acquired_texture: None,
+                    });
+                    Ok(())
+                }
+                Err(error) => Err(match error {
+                    hal::SurfaceError::Outdated
+                    | hal::SurfaceError::Lost
+                    | hal::SurfaceError::Occluded
+                    | hal::SurfaceError::Timeout => E::InvalidSurface,
+                    hal::SurfaceError::Device(error) => E::Device(device.handle_hal_error(error)),
+                    hal::SurfaceError::Other(message) => {
+                        log::error!("surface configuration failed: {message}");
+                        E::InvalidSurface
+                    }
+                }),
             }
-
-            *presentation = Some(Presentation {
-                device: Arc::clone(device),
-                config: config.clone(),
-                acquired_texture: None,
-            });
-        }
+        };
         user_callbacks.fire();
 
-        Ok(())
+        result
     }
 }
 
@@ -1047,11 +1096,16 @@ impl Drop for Surface {
 pub struct Adapter {
     pub(crate) raw: hal::DynExposedAdapter,
     pub(crate) instance: Arc<Instance>,
+    consumed: AtomicBool,
 }
 
 impl Adapter {
     pub(crate) fn new(raw: hal::DynExposedAdapter, instance: Arc<Instance>) -> Arc<Self> {
-        Arc::new(Self { raw, instance })
+        Arc::new(Self {
+            raw,
+            instance,
+            consumed: AtomicBool::new(false),
+        })
     }
 
     /// Returns the backend this adapter is using.
@@ -1091,13 +1145,26 @@ impl Adapter {
         self.raw.capabilities.cooperative_matrix_properties.clone()
     }
 
+    pub fn ray_tracing_invocation_reorder_mode(&self) -> wgt::RayTracingInvocationReorderMode {
+        self.raw.capabilities.ray_tracing_invocation_reorder_mode
+    }
+
     pub fn get_texture_format_features(
         &self,
         format: wgt::TextureFormat,
     ) -> wgt::TextureFormatFeatures {
         use hal::TextureFormatCapabilities as Tfc;
 
-        let caps = unsafe { self.raw.adapter.texture_format_capabilities(format) };
+        let mut caps = unsafe { self.raw.adapter.texture_format_capabilities(format) };
+
+        // Storage bindings of multi-planar textures are not supported.
+        if format.is_multi_planar_format() {
+            caps -= Tfc::STORAGE_READ_ONLY
+                | Tfc::STORAGE_WRITE_ONLY
+                | Tfc::STORAGE_READ_WRITE
+                | Tfc::STORAGE_ATOMIC;
+        }
+
         let mut allowed_usages = wgt::TextureUsages::empty();
 
         allowed_usages.set(wgt::TextureUsages::COPY_SRC, caps.contains(Tfc::COPY_SRC));
@@ -1193,6 +1260,15 @@ impl Adapter {
         profiling::scope!("Adapter::create_device_and_queue_from_hal");
         api_log!("Adapter::create_device_and_queue_from_hal");
 
+        if self
+            .instance
+            .flags
+            .contains(InstanceFlags::STRICT_WEBGPU_COMPLIANCE)
+            && self.consumed.load(Ordering::SeqCst)
+        {
+            return Err(RequestDeviceError::AdapterConsumed);
+        }
+
         let default_queue_desc = desc.default_queue.clone();
 
         let device = Device::new(hal_device.device, self, desc, self.instance.flags)?;
@@ -1213,6 +1289,8 @@ impl Adapter {
         resource_log!("Created Queue {:?}", Arc::as_ptr(&queue));
 
         self.instance.devices.push(&device);
+
+        self.consumed.store(true, Ordering::SeqCst);
 
         Ok((device, queue))
     }
@@ -1344,6 +1422,8 @@ pub enum RequestDeviceError {
         "Some experimental features, {0}, were requested, but experimental features are not enabled"
     )]
     ExperimentalFeaturesNotEnabled(wgt::Features),
+    #[error("The adapter has already been consumed.")]
+    AdapterConsumed,
 }
 
 #[derive(Clone, Debug, Error)]
@@ -1372,7 +1452,7 @@ fn adapter_allowed(
     flags: InstanceFlags,
     info: &impl fmt::Debug,
     limits: &wgt::Limits,
-    downlevel: &wgt::DownlevelCapabilities,
+    features: wgt::Features,
 ) -> bool {
     // Check "All alignment-class limits must be powers of 2."
     //
@@ -1403,25 +1483,11 @@ fn adapter_allowed(
         return true;
     }
 
-    // Check "All supported limits must be either the default value or better."
-    let mut min_limits = wgt::Limits::defaults();
-    min_limits.zero_native_only();
-    let failed_limits = check_limits(&min_limits, limits);
-    if !failed_limits.is_empty() {
+    if !features.contains(wgt::Features::CORE_FEATURES_AND_LIMITS) {
         log::debug!(
-            "Adapter {:?} is not WebGPU compliant due to limits: {:?}",
-            info,
-            failed_limits
-        );
-        return false;
-    }
-
-    if !downlevel.is_webgpu_compliant() {
-        let missing_flags = wgt::DownlevelFlags::compliant() - downlevel.flags;
-        log::debug!(
-            "Adapter {:?} is not WebGPU compliant due to missing downlevel flags: {:?}",
-            info,
-            missing_flags
+            "Adapter {:?} is not WebGPU compliant because it does not support \
+            CORE_FEATURES_AND_LIMITS",
+            info
         );
         return false;
     }
@@ -1491,13 +1557,6 @@ fn normalize_max_resource_per_shader_stage_limits(limits: &mut wgt::Limits) {
 mod tests {
     use super::*;
 
-    fn compliant_downlevel() -> wgt::DownlevelCapabilities {
-        wgt::DownlevelCapabilities {
-            flags: wgt::DownlevelFlags::compliant(),
-            ..Default::default()
-        }
-    }
-
     #[test]
     fn non_power_of_two_uniform_alignment_always_rejected() {
         let limits = wgt::Limits {
@@ -1508,13 +1567,13 @@ mod tests {
             InstanceFlags::empty(),
             &"",
             &limits,
-            &compliant_downlevel()
+            wgt::Features::CORE_FEATURES_AND_LIMITS
         ));
         assert!(!adapter_allowed(
             InstanceFlags::STRICT_WEBGPU_COMPLIANCE,
             &"",
             &limits,
-            &compliant_downlevel()
+            wgt::Features::CORE_FEATURES_AND_LIMITS
         ));
     }
 
@@ -1528,13 +1587,13 @@ mod tests {
             InstanceFlags::empty(),
             &"",
             &limits,
-            &compliant_downlevel()
+            wgt::Features::CORE_FEATURES_AND_LIMITS
         ));
         assert!(!adapter_allowed(
             InstanceFlags::STRICT_WEBGPU_COMPLIANCE,
             &"",
             &limits,
-            &compliant_downlevel()
+            wgt::Features::CORE_FEATURES_AND_LIMITS
         ));
     }
 
@@ -1548,7 +1607,7 @@ mod tests {
             InstanceFlags::empty(),
             &"",
             &limits,
-            &wgt::DownlevelCapabilities::default()
+            wgt::Features::empty()
         ));
     }
 
@@ -1562,21 +1621,17 @@ mod tests {
             InstanceFlags::STRICT_WEBGPU_COMPLIANCE,
             &"",
             &limits,
-            &compliant_downlevel()
+            wgt::Features::empty()
         ));
     }
 
     #[test]
-    fn missing_downlevel_flags_rejected_with_strict_compliance() {
-        let downlevel = wgt::DownlevelCapabilities {
-            flags: wgt::DownlevelFlags::empty(),
-            ..Default::default()
-        };
+    fn missing_core_features_and_limits_rejected_with_strict_compliance() {
         assert!(!adapter_allowed(
             InstanceFlags::STRICT_WEBGPU_COMPLIANCE,
             &"",
             &wgt::Limits::defaults(),
-            &downlevel
+            wgt::Features::empty()
         ));
     }
 
@@ -1586,7 +1641,7 @@ mod tests {
             InstanceFlags::STRICT_WEBGPU_COMPLIANCE,
             &"",
             &wgt::Limits::defaults(),
-            &compliant_downlevel()
+            wgt::Features::CORE_FEATURES_AND_LIMITS
         ));
     }
 
@@ -1697,5 +1752,14 @@ mod tests {
                 &wgt::Limits::defaults(),
             );
         }
+    }
+
+    #[test]
+    fn downlevel_default_limits_less_than_default_limits() {
+        let res = check_limits(&wgt::Limits::downlevel_defaults(), &wgt::Limits::default());
+        assert!(
+            res.is_empty(),
+            "Downlevel limits are greater than default limits",
+        )
     }
 }

@@ -19,6 +19,99 @@ const INDEXING_FEATURES: wgt::Features = wgt::Features::TEXTURE_BINDING_ARRAY
     .union(wgt::Features::STORAGE_TEXTURE_ARRAY_NON_UNIFORM_INDEXING)
     .union(wgt::Features::UNIFORM_BUFFER_BINDING_ARRAYS)
     .union(wgt::Features::PARTIALLY_BOUND_BINDING_ARRAY);
+
+/// Features that need `VK_KHR_ray_tracing_pipeline`, either directly or as a dependency.
+const RAY_TRACING_PIPELINE_FEATURES: wgt::Features =
+    wgt::Features::EXPERIMENTAL_RAY_TRACING_PIPELINES
+        .union(wgt::Features::EXPERIMENTAL_RAY_TRACING_INVOCATION_REORDER);
+
+/// `VK_EXT_ray_tracing_invocation_reorder`, which provides `SPV_EXT_shader_invocation_reorder`.
+///
+/// `ash` has no bindings for this, so we create bindings ad-hoc as needed. See also:
+///
+/// - <https://registry.khronos.org/vulkan/specs/latest/man/html/VK_EXT_ray_tracing_invocation_reorder.html>
+mod ray_tracing_invocation_reorder {
+    use ash::vk;
+    use core::{
+        ffi::{c_void, CStr},
+        ptr,
+    };
+
+    pub const NAME: &CStr = c"VK_EXT_ray_tracing_invocation_reorder";
+
+    /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT`.
+    const FEATURES_STRUCTURE_TYPE: vk::StructureType = vk::StructureType::from_raw(1_000_581_000);
+
+    /// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_PROPERTIES_EXT`.
+    const PROPERTIES_STRUCTURE_TYPE: vk::StructureType = vk::StructureType::from_raw(1_000_581_001);
+
+    /// `VK_RAY_TRACING_INVOCATION_REORDER_MODE_REORDER_EXT`.
+    const MODE_REORDER: i32 = 1;
+
+    /// <https://registry.khronos.org/vulkan/specs/latest/man/html/VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.html>
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct FeaturesEXT {
+        pub s_type: vk::StructureType,
+        pub p_next: *mut c_void,
+        pub ray_tracing_invocation_reorder: vk::Bool32,
+    }
+
+    impl Default for FeaturesEXT {
+        fn default() -> Self {
+            Self {
+                s_type: FEATURES_STRUCTURE_TYPE,
+                p_next: ptr::null_mut(),
+                ray_tracing_invocation_reorder: vk::FALSE,
+            }
+        }
+    }
+
+    // SAFETY: The layout and `structextends` match `vk.xml`. `p_next` is only a chain pointer.
+    unsafe impl vk::ExtendsDeviceCreateInfo for FeaturesEXT {}
+    unsafe impl vk::ExtendsPhysicalDeviceFeatures2 for FeaturesEXT {}
+    unsafe impl Send for FeaturesEXT {}
+    unsafe impl Sync for FeaturesEXT {}
+
+    /// <https://registry.khronos.org/vulkan/specs/latest/man/html/VkPhysicalDeviceRayTracingInvocationReorderPropertiesEXT.html>
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct PropertiesEXT {
+        pub s_type: vk::StructureType,
+        pub p_next: *mut c_void,
+        /// A `VkRayTracingInvocationReorderModeEXT` hint that tells if the implementation is
+        /// likely to reorder invocations.
+        pub ray_tracing_invocation_reorder_reordering_hint: i32,
+        /// Unused: naga exposes no way to set a hit object's shader binding table record index.
+        pub max_shader_binding_table_record_index: u32,
+    }
+
+    impl Default for PropertiesEXT {
+        fn default() -> Self {
+            Self {
+                s_type: PROPERTIES_STRUCTURE_TYPE,
+                p_next: ptr::null_mut(),
+                ray_tracing_invocation_reorder_reordering_hint: 0,
+                max_shader_binding_table_record_index: 0,
+            }
+        }
+    }
+
+    impl PropertiesEXT {
+        pub fn mode(&self) -> wgt::RayTracingInvocationReorderMode {
+            if self.ray_tracing_invocation_reorder_reordering_hint == MODE_REORDER {
+                wgt::RayTracingInvocationReorderMode::Reorder
+            } else {
+                wgt::RayTracingInvocationReorderMode::None
+            }
+        }
+    }
+
+    // SAFETY: The layout and `structextends` match `vk.xml`. `p_next` is only a chain pointer.
+    unsafe impl vk::ExtendsPhysicalDeviceProperties2 for PropertiesEXT {}
+    unsafe impl Send for PropertiesEXT {}
+    unsafe impl Sync for PropertiesEXT {}
+}
 #[expect(rustdoc::private_intra_doc_links)]
 /// Features supported by a [`vk::PhysicalDevice`] and its extensions.
 ///
@@ -102,6 +195,9 @@ pub struct PhysicalDeviceFeatures {
 
     /// Features provided by `VK_KHR_ray_tracing_pipeline`.
     ray_tracing_pipeline: Option<vk::PhysicalDeviceRayTracingPipelineFeaturesKHR<'static>>,
+
+    /// Features provided by `VK_EXT_ray_tracing_invocation_reorder`.
+    ray_tracing_invocation_reorder: Option<ray_tracing_invocation_reorder::FeaturesEXT>,
 
     /// Features provided by `VK_KHR_zero_initialize_workgroup_memory`, promoted
     /// to Vulkan 1.3.
@@ -196,6 +292,9 @@ impl PhysicalDeviceFeatures {
             info = info.push_next(feature);
         }
         if let Some(ref mut feature) = self.ray_tracing_pipeline {
+            info = info.push_next(feature);
+        }
+        if let Some(ref mut feature) = self.ray_tracing_invocation_reorder {
             info = info.push_next(feature);
         }
         if let Some(ref mut feature) = self.shader_atomic_int64 {
@@ -363,6 +462,7 @@ impl PhysicalDeviceFeatures {
                 //.shader_resource_residency(requested_features.contains(wgt::Features::SHADER_RESOURCE_RESIDENCY))
                 .geometry_shader(requested_features.contains(wgt::Features::PRIMITIVE_INDEX))
                 .depth_clamp(requested_features.contains(wgt::Features::DEPTH_CLIP_CONTROL))
+                .depth_bias_clamp(downlevel_flags.contains(wgt::DownlevelFlags::DEPTH_BIAS_CLAMP))
                 .dual_src_blend(requested_features.contains(wgt::Features::DUAL_SOURCE_BLENDING)),
             descriptor_indexing: if requested_features.intersects(INDEXING_FEATURES) {
                 Some(
@@ -487,6 +587,16 @@ impl PhysicalDeviceFeatures {
                     vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default()
                         .ray_tracing_pipeline(true),
                 )
+            } else {
+                None
+            },
+            ray_tracing_invocation_reorder: if enabled_extensions
+                .contains(&ray_tracing_invocation_reorder::NAME)
+            {
+                Some(ray_tracing_invocation_reorder::FeaturesEXT {
+                    ray_tracing_invocation_reorder: vk::TRUE,
+                    ..Default::default()
+                })
             } else {
                 None
             },
@@ -671,35 +781,37 @@ impl PhysicalDeviceFeatures {
     ) -> (wgt::Features, wgt::DownlevelFlags) {
         use wgt::{DownlevelFlags as Df, Features as F};
         let mut features = F::empty()
-            | F::MAPPABLE_PRIMARY_BUFFERS
-            | F::IMMEDIATES
             | F::ADDRESS_MODE_CLAMP_TO_BORDER
             | F::ADDRESS_MODE_CLAMP_TO_ZERO
-            | F::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
             | F::CLEAR_TEXTURE
+            | F::IMMEDIATES
+            | F::MAPPABLE_PRIMARY_BUFFERS
+            | F::MEMORY_DECORATION_COHERENT
+            | F::MEMORY_DECORATION_VOLATILE
+            | F::PASSTHROUGH_SHADERS
             | F::PIPELINE_CACHE
             | F::SHADER_EARLY_DEPTH_TEST
+            | F::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
             | F::TEXTURE_ATOMIC
-            | F::PASSTHROUGH_SHADERS
-            | F::MEMORY_DECORATION_COHERENT
-            | F::MEMORY_DECORATION_VOLATILE;
+            | F::UNRESTRICTED_BYTES_PER_ROW;
 
-        let mut dl_flags = Df::COMPUTE_SHADERS
+        let mut dl_flags = Df::empty()
+            | Df::ARBITRARY_BINDING_VIEW_DIMENSIONS
             | Df::BASE_VERTEX
-            | Df::NON_POWER_OF_TWO_MIPMAPPED_TEXTURES
-            | Df::COMPARISON_SAMPLERS
-            | Df::VERTEX_STORAGE
-            | Df::FRAGMENT_STORAGE
-            | Df::DEPTH_TEXTURE_AND_BUFFER_COPIES
             | Df::BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED
-            | Df::UNRESTRICTED_INDEX_BUFFER
+            | Df::COMPARISON_SAMPLERS
+            | Df::COMPUTE_SHADERS
+            | Df::DEPTH_TEXTURE_AND_BUFFER_COPIES
+            | Df::FRAGMENT_STORAGE
             | Df::INDIRECT_EXECUTION
-            | Df::VIEW_FORMATS
-            | Df::UNRESTRICTED_EXTERNAL_TEXTURE_COPIES
-            | Df::NONBLOCKING_QUERY_RESOLVE
-            | Df::SHADER_F16_IN_F32
+            | Df::LINEAR_INTERPOLATION
             | Df::MSL2_1
-            | Df::LINEAR_INTERPOLATION;
+            | Df::NONBLOCKING_QUERY_RESOLVE
+            | Df::NON_POWER_OF_TWO_MIPMAPPED_TEXTURES
+            | Df::UNRESTRICTED_EXTERNAL_TEXTURE_COPIES
+            | Df::UNRESTRICTED_INDEX_BUFFER
+            | Df::VERTEX_STORAGE
+            | Df::VIEW_FORMATS;
 
         // `VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL`
         // and `VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL`
@@ -1000,6 +1112,15 @@ impl PhysicalDeviceFeatures {
                         // Same reason as for ray queries.
                         | F::EXTENDED_ACCELERATION_STRUCTURE_VERTEX_FORMATS,
             );
+
+            // Hit objects only exist in ray tracing pipeline stages, so this is of no use
+            // without `EXPERIMENTAL_RAY_TRACING_PIPELINES`.
+            if let Some(ref reorder) = self.ray_tracing_invocation_reorder {
+                features.set(
+                    F::EXPERIMENTAL_RAY_TRACING_INVOCATION_REORDER,
+                    reorder.ray_tracing_invocation_reorder != 0,
+                );
+            }
         }
 
         let rg11b10ufloat_renderable = supports_format(
@@ -1058,25 +1179,6 @@ impl PhysicalDeviceFeatures {
         }
 
         features.set(
-            F::VULKAN_GOOGLE_DISPLAY_TIMING,
-            caps.supports_extension(google::display_timing::NAME),
-        );
-
-        features.set(
-            F::VULKAN_EXTERNAL_MEMORY_WIN32,
-            caps.supports_extension(khr::external_memory_win32::NAME),
-        );
-        features.set(
-            F::VULKAN_EXTERNAL_MEMORY_FD,
-            caps.supports_extension(khr::external_memory_fd::NAME),
-        );
-        features.set(
-            F::VULKAN_EXTERNAL_MEMORY_DMA_BUF,
-            caps.supports_extension(khr::external_memory_fd::NAME)
-                && caps.supports_extension(ext::external_memory_dma_buf::NAME)
-                && caps.supports_extension(ext::image_drm_format_modifier::NAME),
-        );
-        features.set(
             F::EXPERIMENTAL_MESH_SHADER,
             caps.supports_extension(ext::mesh_shader::NAME),
         );
@@ -1123,6 +1225,12 @@ impl PhysicalDeviceFeatures {
             self.shader_draw_parameters
                 .is_some_and(|a| a.shader_draw_parameters != 0)
                 || caps.supports_extension(c"VK_KHR_shader_draw_parameters"),
+        );
+
+        features.set(
+            F::DEBUG_PRINTF,
+            caps.device_api_version >= vk::API_VERSION_1_3
+                || caps.supports_extension(khr::shader_non_semantic_info::NAME),
         );
 
         (features, dl_flags)
@@ -1182,6 +1290,10 @@ pub struct PhysicalDeviceProperties {
     /// Additional `vk::PhysicalDevice` properties from the
     /// `VK_KHR_ray_tracing_pipeline` extension.
     ray_tracing_pipeline: Option<vk::PhysicalDeviceRayTracingPipelinePropertiesKHR<'static>>,
+
+    /// Additional `vk::PhysicalDevice` properties from the
+    /// `VK_EXT_ray_tracing_invocation_reorder` extension.
+    ray_tracing_invocation_reorder: Option<ray_tracing_invocation_reorder::PropertiesEXT>,
 
     /// Additional `vk::PhysicalDevice` properties from the
     /// `VK_KHR_driver_properties` extension, promoted to Vulkan 1.2.
@@ -1319,11 +1431,11 @@ impl PhysicalDeviceProperties {
                 extensions.push(khr::shader_float16_int8::NAME);
             }
 
-            // `SPV_EXT_mesh_shader` and `SPV_KHR_ray_tracing` both require SPIR-V 1.4.
-            if requested_features.intersects(
-                wgt::Features::EXPERIMENTAL_MESH_SHADER
-                    | wgt::Features::EXPERIMENTAL_RAY_TRACING_PIPELINES,
-            ) {
+            // `SPV_EXT_mesh_shader`, `SPV_KHR_ray_tracing` and
+            // `SPV_EXT_shader_invocation_reorder` all require SPIR-V 1.4.
+            if requested_features
+                .intersects(wgt::Features::EXPERIMENTAL_MESH_SHADER | RAY_TRACING_PIPELINE_FEATURES)
+            {
                 extensions.push(khr::spirv_1_4::NAME);
             }
 
@@ -1379,11 +1491,21 @@ impl PhysicalDeviceProperties {
             if self.supports_extension(ext::load_store_op_none::NAME) {
                 extensions.push(ext::load_store_op_none::NAME);
             }
+
+            // Require `VK_KHR_shader_non_semantic_info` if the associated feature was requested
+            if requested_features.contains(wgt::Features::DEBUG_PRINTF) {
+                extensions.push(khr::shader_non_semantic_info::NAME);
+            }
         }
 
         // Optional `VK_KHR_swapchain_mutable_format`
         if self.supports_extension(khr::swapchain_mutable_format::NAME) {
             extensions.push(khr::swapchain_mutable_format::NAME);
+        }
+
+        // Optional `VK_KHR_incremental_present`
+        if self.supports_extension(khr::incremental_present::NAME) {
+            extensions.push(khr::incremental_present::NAME);
         }
 
         // Optional `VK_EXT_robustness2`
@@ -1411,6 +1533,11 @@ impl PhysicalDeviceProperties {
             extensions.push(ext::image_drm_format_modifier::NAME);
         }
 
+        // Optional `VK_GOOGLE_display_timing`
+        if self.supports_extension(google::display_timing::NAME) {
+            extensions.push(google::display_timing::NAME);
+        }
+
         // Optional `VK_EXT_memory_budget`
         if self.supports_extension(ext::memory_budget::NAME) {
             extensions.push(ext::memory_budget::NAME);
@@ -1426,10 +1553,9 @@ impl PhysicalDeviceProperties {
         }
 
         // Require `VK_KHR_deferred_host_operations`, `VK_KHR_acceleration_structure` `VK_KHR_buffer_device_address` (for acceleration structures) if either `EXPERIMENTAL_RAY_QUERY` or `EXPERIMENTAL_RAY_TRACING_PIPELINES` were requested.
-        if requested_features.intersects(
-            wgt::Features::EXPERIMENTAL_RAY_QUERY
-                | wgt::Features::EXPERIMENTAL_RAY_TRACING_PIPELINES,
-        ) {
+        if requested_features
+            .intersects(wgt::Features::EXPERIMENTAL_RAY_QUERY | RAY_TRACING_PIPELINE_FEATURES)
+        {
             extensions.push(khr::deferred_host_operations::NAME);
             extensions.push(khr::acceleration_structure::NAME);
             extensions.push(khr::buffer_device_address::NAME);
@@ -1440,9 +1566,16 @@ impl PhysicalDeviceProperties {
             extensions.push(khr::ray_query::NAME);
         }
 
-        // Require `VK_KHR_ray_tracing_pipeline` if `EXPERIMENTAL_RAY_TRACING_PIPELINES` was requested
-        if requested_features.contains(wgt::Features::EXPERIMENTAL_RAY_TRACING_PIPELINES) {
+        // Require `VK_KHR_ray_tracing_pipeline` if `EXPERIMENTAL_RAY_TRACING_PIPELINES` was
+        // requested, or `EXPERIMENTAL_RAY_TRACING_INVOCATION_REORDER`, which depends on it.
+        if requested_features.intersects(RAY_TRACING_PIPELINE_FEATURES) {
             extensions.push(khr::ray_tracing_pipeline::NAME);
+        }
+
+        // Require `VK_EXT_ray_tracing_invocation_reorder` if
+        // `EXPERIMENTAL_RAY_TRACING_INVOCATION_REORDER` was requested.
+        if requested_features.contains(wgt::Features::EXPERIMENTAL_RAY_TRACING_INVOCATION_REORDER) {
+            extensions.push(ray_tracing_invocation_reorder::NAME);
         }
 
         if requested_features.contains(wgt::Features::EXPERIMENTAL_RAY_HIT_VERTEX_RETURN) {
@@ -1478,11 +1611,6 @@ impl PhysicalDeviceProperties {
         // Require `VK_EXT_shader_atomic_float` if the associated feature was requested
         if requested_features.contains(wgt::Features::SHADER_FLOAT32_ATOMIC) {
             extensions.push(ext::shader_atomic_float::NAME);
-        }
-
-        // Require VK_GOOGLE_display_timing if the associated feature was requested
-        if requested_features.contains(wgt::Features::VULKAN_GOOGLE_DISPLAY_TIMING) {
-            extensions.push(google::display_timing::NAME);
         }
 
         if requested_features.contains(wgt::Features::EXPERIMENTAL_MESH_SHADER) {
@@ -1950,6 +2078,9 @@ impl super::InstanceShared {
                 let supports_ray_tracing_pipeline =
                     capabilities.supports_extension(khr::ray_tracing_pipeline::NAME);
 
+                let supports_ray_tracing_invocation_reorder =
+                    capabilities.supports_extension(ray_tracing_invocation_reorder::NAME);
+
                 let supports_mesh_shader = capabilities.supports_extension(ext::mesh_shader::NAME);
 
                 let mut properties2 = vk::PhysicalDeviceProperties2KHR::default();
@@ -1992,6 +2123,13 @@ impl super::InstanceShared {
                     let next = capabilities
                         .ray_tracing_pipeline
                         .insert(vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default());
+                    properties2 = properties2.push_next(next);
+                }
+
+                if supports_ray_tracing_invocation_reorder {
+                    let next = capabilities
+                        .ray_tracing_invocation_reorder
+                        .insert(ray_tracing_invocation_reorder::PropertiesEXT::default());
                     properties2 = properties2.push_next(next);
                 }
 
@@ -2190,6 +2328,13 @@ impl super::InstanceShared {
                 features2 = features2.push_next(next);
             }
 
+            if capabilities.supports_extension(ray_tracing_invocation_reorder::NAME) {
+                let next = features
+                    .ray_tracing_invocation_reorder
+                    .insert(ray_tracing_invocation_reorder::FeaturesEXT::default());
+                features2 = features2.push_next(next);
+            }
+
             // `VK_KHR_maintenance4` is promoted to 1.3
             if capabilities.device_api_version >= vk::API_VERSION_1_3
                 || capabilities.supports_extension(khr::maintenance4::NAME)
@@ -2374,6 +2519,17 @@ impl super::Instance {
                 super::Workarounds::FORCE_FILL_BUFFER_WITH_SIZE_GREATER_4096_ALIGNED_OFFSET_16,
                 phd_capabilities.properties.vendor_id == db::nvidia::VENDOR,
             );
+            workarounds.set(
+                super::Workarounds::POLYFILL_MESH_TASK_WORKGROUP_ZERO_INIT,
+                phd_capabilities.is_driver(vk::DriverId::AMD_PROPRIETARY),
+            );
+            // Matched by driver ID rather than vendor ID: Mesa's PanVK also reports Arm's
+            // vendor ID and is not affected.
+            workarounds.set(
+                super::Workarounds::DISABLE_TIMELINE_SEMAPHORES,
+                phd_capabilities.is_driver(vk::DriverId::ARM_PROPRIETARY)
+                    && arm_driver_leaks_timeline_semaphores(&info.driver_info),
+            );
         };
 
         if let Some(driver) = phd_capabilities.driver {
@@ -2433,15 +2589,6 @@ impl super::Instance {
             queue_family_properties,
         );
 
-        if phd_capabilities.is_driver(vk::DriverId::MESA_LLVMPIPE) {
-            // The `F16_IN_F32` instructions do not normally require native `F16` support, but on
-            // llvmpipe, they do.
-            downlevel_flags.set(
-                wgt::DownlevelFlags::SHADER_F16_IN_F32,
-                available_features.contains(wgt::Features::SHADER_F16),
-            );
-        }
-
         downlevel_flags.set(
             wgt::DownlevelFlags::TEXTURE_COMPRESSION,
             available_features.contains(wgt::Features::TEXTURE_COMPRESSION_BC)
@@ -2462,12 +2609,17 @@ impl super::Instance {
         let private_caps = super::PrivateCapabilities {
             image_view_usage: phd_capabilities.device_api_version >= vk::API_VERSION_1_1
                 || phd_capabilities.supports_extension(khr::maintenance2::NAME),
-            timeline_semaphores: match phd_features.timeline_semaphore {
-                Some(features) => features.timeline_semaphore == vk::TRUE,
-                None => phd_features
-                    .timeline_semaphore
-                    .is_some_and(|ext| ext.timeline_semaphore != 0),
-            },
+            // VeriSilicon's proprietary driver, as on NXP's i.MX 8 SoCs, advertises timeline
+            // semaphores but crashes in `vkQueueSubmit` when wgpu uses them. It reports
+            // `VK_DRIVER_ID_MESA_RADV` as its driver ID, so only the vendor ID identifies it.
+            timeline_semaphores: phd_capabilities.properties.vendor_id != db::verisilicon::VENDOR
+                && !workarounds.contains(super::Workarounds::DISABLE_TIMELINE_SEMAPHORES)
+                && match phd_features.timeline_semaphore {
+                    Some(features) => features.timeline_semaphore == vk::TRUE,
+                    None => phd_features
+                        .timeline_semaphore
+                        .is_some_and(|ext| ext.timeline_semaphore != 0),
+                },
             texture_d24: supports_format(
                 &self.shared.raw,
                 phd,
@@ -2532,12 +2684,15 @@ impl super::Instance {
                 .map(|maintenance_5| maintenance_5.depth_stencil_swizzle_one_support == vk::TRUE)
                 .unwrap_or(false),
             ray_tracing_pipeline_group_data_size: alignments.ray_tracing_pipeline_group_data_size,
+            shader_binding_table_alignment: alignments.ray_tracing_pipeline_data_offset_alignment,
             store_op_none: phd_capabilities.device_api_version >= vk::API_VERSION_1_3
                 || (phd_capabilities.device_api_version >= vk::API_VERSION_1_2
                     && phd_capabilities.supports_extension(khr::dynamic_rendering::NAME))
                 || phd_capabilities.supports_extension(khr::load_store_op_none::NAME)
                 || phd_capabilities.supports_extension(ash::qcom::render_pass_store_ops::NAME)
                 || phd_capabilities.supports_extension(ext::load_store_op_none::NAME),
+            incremental_present: phd_capabilities
+                .supports_extension(khr::incremental_present::NAME),
         };
         let capabilities = crate::Capabilities {
             limits: phd_capabilities.to_wgpu_limits(),
@@ -2548,6 +2703,17 @@ impl super::Instance {
                 shader_model: wgt::ShaderModel::Sm5, //TODO?
             },
             cooperative_matrix_properties: phd_capabilities.cooperative_matrix_properties.clone(),
+            ray_tracing_invocation_reorder_mode: match phd_capabilities
+                .ray_tracing_invocation_reorder
+            {
+                Some(properties)
+                    if available_features
+                        .contains(wgt::Features::EXPERIMENTAL_RAY_TRACING_INVOCATION_REORDER) =>
+                {
+                    properties.mode()
+                }
+                _ => wgt::RayTracingInvocationReorderMode::None,
+            },
         };
 
         let adapter = super::Adapter {
@@ -2564,6 +2730,15 @@ impl super::Instance {
             downlevel_flags,
             private_caps,
             workarounds,
+        };
+
+        let available_features = if crate::auxil::supports_core_features_and_limits(
+            &capabilities.limits,
+            &capabilities.downlevel,
+        ) {
+            available_features | wgt::Features::CORE_FEATURES_AND_LIMITS
+        } else {
+            available_features
         };
 
         Some(crate::ExposedAdapter {
@@ -2889,6 +3064,9 @@ impl super::Adapter {
             if features.contains(wgt::Features::EXPERIMENTAL_RAY_HIT_VERTEX_RETURN) {
                 capabilities.push(spv::Capability::RayQueryPositionFetchKHR)
             }
+            if features.contains(wgt::Features::EXPERIMENTAL_RAY_TRACING_INVOCATION_REORDER) {
+                capabilities.push(spv::Capability::ShaderInvocationReorderEXT);
+            }
             if features.contains(wgt::Features::EXPERIMENTAL_MESH_SHADER) {
                 capabilities.push(spv::Capability::MeshShadingEXT);
             }
@@ -3046,19 +3224,17 @@ impl super::Adapter {
             next_submit_chain: Mutex::new(None),
         };
 
-        let allocation_sizes = AllocationSizes::from_memory_hints(memory_hints).into();
+        let allocation_sizes = AllocationSizes::from_memory_hints(memory_hints);
 
         let buffer_device_address = enabled_extensions.contains(&khr::buffer_device_address::NAME);
 
-        let mem_allocator =
-            gpu_allocator::vulkan::Allocator::new(&gpu_allocator::vulkan::AllocatorCreateDesc {
-                instance: self.instance.raw.clone(),
-                device: shared.raw.clone(),
-                physical_device: self.raw,
-                debug_settings: Default::default(),
-                buffer_device_address,
-                allocation_sizes,
-            })?;
+        let mem_allocator = super::MemoryAllocators::new(
+            self.instance.raw.clone(),
+            shared.raw.clone(),
+            self.raw,
+            buffer_device_address,
+            allocation_sizes,
+        )?;
 
         let desc_allocator = super::descriptor::DescriptorAllocator::new(
             if let Some(di) = self.phd_capabilities.descriptor_indexing {
@@ -3070,7 +3246,7 @@ impl super::Adapter {
 
         let device = super::Device {
             shared,
-            mem_allocator: Mutex::new(mem_allocator),
+            mem_allocator,
             desc_allocator: Mutex::new(desc_allocator),
             valid_ash_memory_types,
             naga_options,
@@ -3238,6 +3414,18 @@ impl crate::Adapter for super::Adapter {
             Tfc::STORAGE_ATOMIC,
             features.intersects(vk::FormatFeatureFlags::STORAGE_IMAGE_ATOMIC),
         );
+        // Multi-planar images are created with `EXTENDED_USAGE`, so views of
+        // the planes are limited by the plane view formats, not by this format.
+        if format.is_multi_planar_format() && !flags.is_empty() {
+            let plane_caps = |aspect| unsafe {
+                self.texture_format_capabilities(format.aspect_specific_format(aspect).unwrap())
+            };
+            return (flags & (Tfc::COPY_SRC | Tfc::COPY_DST))
+                | (plane_caps(wgt::TextureAspect::Plane0)
+                    & plane_caps(wgt::TextureAspect::Plane1)
+                    & Tfc::VALID_FOR_MULTI_PLANAR);
+        }
+
         // Vulkan is very permissive about MSAA
         flags.set(Tfc::MULTISAMPLE_RESOLVE, !format.is_compressed());
 
@@ -3406,7 +3594,7 @@ fn is_float32_blendable_supported(instance: &ash::Instance, phd: vk::PhysicalDev
     })
 }
 
-fn supports_format(
+pub(super) fn supports_format(
     instance: &ash::Instance,
     phd: vk::PhysicalDevice,
     format: vk::Format,
@@ -3521,6 +3709,27 @@ fn is_intel_igpu_outdated_for_robustness2(capabilities: &PhysicalDevicePropertie
         );
     }
     is_outdated
+}
+
+/// Returns `true` if Arm's proprietary driver can leak memory on timeline semaphore signals.
+///
+/// Arm fixed this in `r46`. Rockchip's `g`-numbered drivers have the fix from `g24` at the latest.
+/// If `driver_info` does not start with `v1.r<N>p` or `v1.g<N>p`, this returns `true`.
+fn arm_driver_leaks_timeline_semaphores(driver_info: &str) -> bool {
+    let Some(release) = driver_info.strip_prefix("v1.") else {
+        return true;
+    };
+    let (fixed_in, rest) = if let Some(rest) = release.strip_prefix('r') {
+        (46, rest)
+    } else if let Some(rest) = release.strip_prefix('g') {
+        (24, rest)
+    } else {
+        return true;
+    };
+    match rest.split_once('p') {
+        Some((number, _)) => number.parse::<u32>().map_or(true, |n| n < fixed_in),
+        None => true,
+    }
 }
 
 /// Convert Vulkan component type to wgt::CooperativeScalarType.
@@ -3645,4 +3854,22 @@ fn query_cooperative_matrix_properties(
         result.len()
     );
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::arm_driver_leaks_timeline_semaphores as leaks;
+
+    #[test]
+    fn arm_timeline_semaphore_driver_versions() {
+        assert!(leaks("v1.g18p0-01eac0.9e534f339477793d151cc7ab4c27f2c0"));
+        assert!(!leaks("v1.g24p0-00eac0.3c7aec95bbe4cb46ae6709632084ff89"));
+        assert!(leaks(
+            "v1.r44p0-wayland-drm-g310-dmaheap-aarch64-d877e132c-18"
+        ));
+        assert!(!leaks("v1.r46p0-01eac0"));
+        assert!(leaks("?"));
+        assert!(leaks("v1.x50p0"));
+        assert!(leaks("v1.r50"));
+    }
 }

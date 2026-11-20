@@ -85,7 +85,7 @@ impl GPUCanvasContext {
         "`GPUCanvasConfiguration.usage` must not include `TRANSIENT_ATTACHMENT`",
       ));
     }
-    let format = configuration.format.clone().into();
+    let format = configuration.format.into();
     let conf = wgpu_types::SurfaceConfiguration {
       usage: configuration.usage.into(),
       format,
@@ -151,8 +151,9 @@ impl GPUCanvasContext {
           wgpu_texture: output.texture.unwrap(),
           default_view: Default::default(),
           dimension: crate::texture::GPUTextureDimension::D2,
-          format: config.format.clone(),
+          format: config.format,
           usage: config.usage,
+          weak: Default::default(),
         };
         let obj = make_cppgc_object(scope, texture);
         let obj = v8::Global::new(scope, obj);

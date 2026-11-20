@@ -17,13 +17,20 @@
 //!   uninstrumented, no-overhead wrappers around the standard lock
 //!   types.
 //!
-//! If the `wgpu_validate_locks` config is set (for example, with
-//! `RUSTFLAGS='--cfg wgpu_validate_locks'`), `wgpu-core` uses the
-//! [`ranked`] module's locks. We hope to make this the default for
-//! debug builds soon.
+//! To get `ranked`, build with the `wgpu_validate_locks` config set, perhaps
+//! with `RUSTFLAGS='--cfg wgpu_validate_locks'`. The `"std"` feature must also
+//! be enabled, as `ranked` needs thread-local storage.
 //!
-//! If the `observe_locks` feature is enabled, `wgpu-core` uses the
-//! [`observing`] module's locks.
+//! To get `ranked` only when debug assertions are also enabled, build with the
+//! `wgpu_validate_locks_debug` config set. The `wgpu` crate selects this via
+//! its `.cargo/config.toml` file, so lock validation is active by default in
+//! `wgpu` CI and `wgpu` development trees, but not in `wgpu`-using applications
+//! unless specifically requested.
+//!
+//! To get `observing`, enable the `"observe_locks"` feature. This also enables
+//! `"std"`. You must also ensure that `wgpu_validate_locks` is not set, as that
+//! takes precedence --- and it's enabled automatically in debug builds for
+//! `wgpu`, as explained above.
 //!
 //! Otherwise, `wgpu-core` uses the [`vanilla`] module's locks.
 //!
@@ -33,23 +40,41 @@
 
 pub mod rank;
 
+// Include all the implementations in the build whenever they can be
+// compiled, even if they're not selected, to catch errors and help
+// `rust-analyzer` find references.
+
 #[cfg(feature = "std")] // requires thread-locals to work
 #[cfg_attr(not(wgpu_validate_locks), allow(dead_code))]
 mod ranked;
 
+// The `observing` module requires the `serde` and `ron` dependencies
+// and the "std" feature for thread-locals. All are enabled by the
+// `"observe_locks"` feature.
 #[cfg(feature = "observe_locks")]
+#[cfg_attr(wgpu_validate_locks, allow(dead_code))]
 mod observing;
 
-#[cfg_attr(any(wgpu_validate_locks, feature = "observe_locks"), allow(dead_code))]
+// If "std" is not enabled, then none of the other modules can be built.
+#[cfg_attr(
+    all(feature = "std", any(wgpu_validate_locks, feature = "observe_locks")),
+    allow(dead_code)
+)]
 mod vanilla;
 
-#[cfg(wgpu_validate_locks)]
+#[cfg(all(wgpu_validate_locks, feature = "std"))]
 use ranked as chosen;
 
-#[cfg(feature = "observe_locks")]
+#[cfg(all(not(wgpu_validate_locks), feature = "observe_locks"))]
 use observing as chosen;
 
-#[cfg(not(any(wgpu_validate_locks, feature = "observe_locks")))]
+// We must use `vanilla`:
+// - whenever `"std"` is not selected, and
+// - whenever neither of the instrumented locks are enabled.
+#[cfg(any(
+    not(feature = "std"),
+    not(any(wgpu_validate_locks, feature = "observe_locks"))
+))]
 use vanilla as chosen;
 
 pub use chosen::{Mutex, MutexGuard, RankData, RwLock, RwLockReadGuard, RwLockWriteGuard};
